@@ -32,12 +32,14 @@ canvas#main{width:100%;height:auto;aspect-ratio:8/5;display:block;touch-action:n
 .th.cur{border-color:var(--acc)}.th canvas{display:block;width:96px;height:60px}
 .th i{position:absolute;left:3px;top:2px;font:600 10px system-ui;color:#555;font-style:normal}
 .hint{color:var(--mute);font-size:12px}
+#stat{word-break:break-word}
 </style></head><body>
 <div class="app">
 <div class="tools box" id="tools">
 <button data-t="pencil" class="on">✎ Pencil</button><button data-t="pen">🖊 Pen</button><button data-t="air">💨 Airbrush</button>
 <button data-t="era">🧽 Eraser</button><button data-t="fill">🪣 Fill</button><button data-t="pick">💧 Pick</button>
 <button id="undo">↶ Undo</button><button id="clr">Clear layer</button><button id="demo">Demo</button>
+<div class="hint" id="stat">Loading…</div>
 </div>
 <div class="stage box"><canvas id="main" width="800" height="500"></canvas></div>
 <div class="side box">
@@ -154,42 +156,77 @@ addEventListener('keydown',e=>{if(e.target.type==='color')return;
   else if(e.key==='ArrowLeft'){stop();go(cur-1)}else if(e.key==='ArrowRight'){stop();go(cur+1)}
   else if(e.key===' '){e.preventDefault();toggle()}else if(e.key==='['){setSize(size-2)}else if(e.key===']'){setSize(size+2)}});
 frames=[mk()];build();buildL();render();
-/* ---------- Saving ---------- */
-const dbOp=async(mode,fn)=>{const d=await new Promise((res,rej)=>{const r=indexedDB.open('flipbook-studio',1);r.onupgradeneeded=()=>r.result.createObjectStore('s');r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error)});
-  return new Promise((res,rej)=>{const t=d.transaction('s',mode),q=fn(t.objectStore('s'));t.oncomplete=()=>res(q&&q.result);t.onerror=()=>rej(t.error)})};
+
+/* ---------- Saving (IndexedDB) ---------- */
+const stat=t=>{$('stat').textContent=t};
+let dbp=null;
+const openDB=()=>dbp||(dbp=new Promise((res,rej)=>{
+  if(!window.indexedDB)return rej(new Error('IndexedDB not available'));
+  const r=indexedDB.open('flipbook-studio',1);
+  r.onupgradeneeded=()=>r.result.createObjectStore('s');
+  r.onsuccess=()=>res(r.result);
+  r.onerror=()=>{dbp=null;rej(r.error||new Error('Could not open database'))};
+  r.onblocked=()=>{dbp=null;rej(new Error('Database blocked; close other tabs of this page'))};
+}));
+const dbOp=async(mode,fn)=>{const d=await openDB();
+  return new Promise((res,rej)=>{const t=d.transaction('s',mode),q=fn(t.objectStore('s'));
+    t.oncomplete=()=>res(q&&q.result);t.onerror=()=>rej(t.error);t.onabort=()=>rej(t.error||new Error('Transaction aborted'))})};
 const dbSet=(k,v)=>dbOp('readwrite',s=>s.put(v,k)),dbGet=k=>dbOp('readonly',s=>s.get(k)),
       dbDel=k=>dbOp('readwrite',s=>s.delete(k)),dbKeys=()=>dbOp('readonly',s=>s.getAllKeys());
-const ser=()=>({meta,fps,frames:frames.map(f=>f.l.map(c=>c.toDataURL()))});
-const loadImg=u=>new Promise(r=>{const i=new Image();i.onload=()=>r(i);i.src=u});
-async function deser(d){stop();meta=d.meta;L=0;fps=d.fps||8;$('fps').value=fps;$('fpsv').textContent=fps;frames=[];
-  for(const ls of d.frames){const f={l:[],h:[]};for(const u of ls){const c=nc();c.getContext('2d').drawImage(await loadImg(u),0,0);f.l.push(c)}frames.push(f)}
-  cur=0;build();buildL();render()}
+const ser=()=>({meta:JSON.parse(JSON.stringify(meta)),fps,frames:frames.map(f=>f.l.map(c=>c.toDataURL()))});
+const loadImg=u=>new Promise((res,rej)=>{const i=new Image();i.onload=()=>res(i);i.onerror=()=>rej(new Error('Bad image data'));i.src=u});
+async function deser(d){
+  if(!d||!Array.isArray(d.meta)||!Array.isArray(d.frames)||!d.frames.length)throw new Error('Invalid animation data');
+  stop();const nf=[];
+  for(const ls of d.frames){const f={l:[],h:[]};for(const u of ls){const c=nc();c.getContext('2d').drawImage(await loadImg(u),0,0);f.l.push(c)}nf.push(f)}
+  meta=d.meta;frames=nf;L=0;cur=0;fps=d.fps||8;$('fps').value=fps;$('fpsv').textContent=fps;
+  build();buildL();render()}
 
-let ready=false,st;
-function queueSave(){if(!ready)return;clearTimeout(st);st=setTimeout(()=>dbSet('autosave',ser()).catch(()=>{}),500)}
-[ 'thumb','build','buildL' ].forEach(n=>{const o=window[n];window[n]=function(){const r=o.apply(this,arguments);queueSave();return r}});
+let ready=false,st=null,saving=false,again=false;
+async function saveNow(){
+  if(!ready)return;
+  if(saving){again=true;return}
+  saving=true;
+  try{await dbSet('autosave',ser());stat('Autosaved '+new Date().toLocaleTimeString())}
+  catch(e){stat('Autosave failed: '+(e&&e.message||e))}
+  saving=false;
+  if(again){again=false;queueSave()}}
+function queueSave(){if(!ready)return;clearTimeout(st);st=setTimeout(saveNow,600)}
+['pointerup','click','input','change','keyup'].forEach(ev=>addEventListener(ev,()=>setTimeout(queueSave,0),true));
+addEventListener('visibilitychange',()=>{if(document.hidden&&ready){clearTimeout(st);saveNow()}});
+addEventListener('pagehide',()=>{if(ready){clearTimeout(st);saveNow()}});
 
 async function saveAs(){const n=(prompt('Name this animation:')||'').trim();if(!n)return;
-  if(n==='autosave')return alert('Please pick another name.');await dbSet(n,ser());alert('Saved "'+n+'"')}
+  if(n==='autosave')return alert('Please pick another name.');
+  try{await dbSet(n,ser());alert('Saved "'+n+'"')}catch(e){alert('Save failed: '+(e&&e.message||e))}}
 const dlg=document.createElement('dialog');dlg.style.cssText='border:1px solid var(--line);border-radius:10px;background:var(--panel);color:var(--ink);min-width:260px';
 document.body.appendChild(dlg);
-async function openDlg(){const ks=(await dbKeys()).filter(k=>k!=='autosave');dlg.innerHTML='<b>Saved animations</b>';
+async function openDlg(){
+  let ks=[];try{ks=(await dbKeys()).filter(k=>k!=='autosave')}catch(e){return alert('Could not read saves: '+(e&&e.message||e))}
+  dlg.innerHTML='<b>Saved animations</b>';
   if(!ks.length)dlg.insertAdjacentHTML('beforeend','<p class="hint">Nothing saved yet.</p>');
   ks.forEach(k=>{const r=document.createElement('div');r.className='row';r.style.margin='6px 0';
-    const o=document.createElement('button');o.textContent=k;o.onclick=async()=>{await deser(await dbGet(k));dlg.close()};
+    const o=document.createElement('button');o.textContent=k;
+    o.onclick=async()=>{try{await deser(await dbGet(k));dlg.close();queueSave()}catch(e){alert('Could not open: '+(e&&e.message||e))}};
     const x=document.createElement('button');x.textContent='🗑';x.style.flex='0';
     x.onclick=async()=>{if(confirm('Delete "'+k+'"?')){await dbDel(k);openDlg()}};
     r.append(o,x);dlg.appendChild(r)});
   const c=document.createElement('button');c.textContent='Close';c.onclick=()=>dlg.close();dlg.appendChild(c);dlg.showModal()}
 function newAnim(){if(!confirm('Start a new animation? Unsaved work will be lost.'))return;
-  stop();meta=[{n:'Layer 1',v:1,o:1}];L=0;frames=[mk()];cur=0;build();buildL();render()}
+  stop();meta=[{n:'Layer 1',v:1,o:1}];L=0;frames=[mk()];cur=0;build();buildL();render();queueSave()}
 function exportF(){const n=prompt('File name:','my-animation');if(!n)return;const a=document.createElement('a');
   a.href=URL.createObjectURL(new Blob([JSON.stringify(ser())],{type:'application/json'}));a.download=n+'.flipbook.json';a.click();
   setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
 const fi=document.createElement('input');fi.type='file';fi.accept='.json';
-fi.onchange=async()=>{const f=fi.files[0];if(!f)return;try{await deser(JSON.parse(await f.text()))}catch(e){alert('Could not read that file.')}fi.value=''};
+fi.onchange=async()=>{const f=fi.files[0];if(!f)return;try{await deser(JSON.parse(await f.text()));queueSave()}catch(e){alert('Could not read that file.')}fi.value=''};
 [['💾 Save as…',saveAs],['📂 Open…',openDlg],['✨ New',newAnim],['⬇ Export',exportF],['⬆ Import',()=>fi.click()]]
-  .forEach(([t,f])=>{const b=document.createElement('button');b.textContent=t;b.onclick=f;$('tools').appendChild(b)});
+  .forEach(([t,f])=>{const b=document.createElement('button');b.textContent=t;b.onclick=f;$('tools').insertBefore(b,$('stat'))});
 
-(async()=>{try{const d=await dbGet('autosave');if(d)await deser(d)}catch(e){}ready=true})();
+(async()=>{
+  try{
+    if(navigator.storage&&navigator.storage.persist)navigator.storage.persist().catch(()=>{});
+    const d=await dbGet('autosave');
+    if(d){await deser(d);stat('Restored your last session')}else stat('Autosave on')
+  }catch(e){stat('Could not restore: '+(e&&e.message||e))}
+  ready=true})();
 </script></body></html>
